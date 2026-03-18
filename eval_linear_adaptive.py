@@ -339,9 +339,9 @@ def build_backbone_from_args(args, checkpoint=None):
 
 
 def eval_linear_adaptive(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        cudnn.benchmark = True
+    utils.init_distributed_mode(args)
+    cudnn.benchmark = True
+    device = torch.device("cuda", args.gpu)
 
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(dict(vars(args)).items())))
@@ -352,13 +352,14 @@ def eval_linear_adaptive(args):
 
     dataset_train = datasets.ImageFolder(train_root, transform=train_transform)
     dataset_val = datasets.ImageFolder(val_root, transform=val_transform)
+    train_sampler = torch.utils.data.DistributedSampler(dataset_train, shuffle=True)
 
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
-        shuffle=True,
+        sampler=train_sampler,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=True,
         drop_last=False,
     )
     val_loader = torch.utils.data.DataLoader(
@@ -366,7 +367,7 @@ def eval_linear_adaptive(args):
         shuffle=False,
         batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=True,
         drop_last=False,
     )
 
@@ -405,12 +406,13 @@ def eval_linear_adaptive(args):
     else:
         embed_dim = backbone.embed_dim * n_last_blocks
         linear_classifier = LinearClassifier(embed_dim, num_labels=args.num_labels).to(device)
+    linear_classifier = nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[args.gpu])
 
     print(f"Data loaded with {len(dataset_train)} train and {len(dataset_val)} val imgs.")
 
     optimizer = torch.optim.SGD(
         linear_classifier.parameters(),
-        args.lr * args.batch_size_per_gpu / 256.0,
+        args.lr * args.batch_size_per_gpu * utils.get_world_size() / 256.0,
         momentum=0.9,
         weight_decay=0,
     )
@@ -437,6 +439,7 @@ def eval_linear_adaptive(args):
         return
 
     for epoch in range(start_epoch, args.epochs):
+        train_loader.sampler.set_epoch(epoch)
         if trajectory_mode:
             train_stats = train_one_epoch_trajectory(
                 backbone,
@@ -487,7 +490,7 @@ def eval_linear_adaptive(args):
                 "scheduler": scheduler.state_dict(),
                 "best_acc": best_acc,
             }
-            torch.save(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
+            utils.save_on_master(save_dict, os.path.join(args.output_dir, "checkpoint.pth.tar"))
 
     print(
         "Training of the supervised linear classifier on frozen adaptive features completed.\n"
@@ -527,6 +530,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", default="./output_linear_adaptive", type=str)
     parser.add_argument("--num_labels", default=100, type=int)
     parser.add_argument("--evaluate", dest="evaluate", action="store_true")
+    parser.add_argument("--dist_url", default="env://", type=str, help="url used to set up distributed training")
+    parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
 
     # Data
     parser.add_argument("--data_path", default="./cifar100_images", type=str, help="Root folder containing train/ and val/ ImageFolder splits.")
