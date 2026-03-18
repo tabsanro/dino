@@ -103,7 +103,7 @@ def run_experiment(args):
     checkpoint_path = os.path.join(args.output_dir, "checkpoint.pth")
     if os.path.isfile(checkpoint_path):
         print(f"=> loading checkpoint '{checkpoint_path}'")
-        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         # MultiCropWrapper인 student 키에서 로드
         model.load_state_dict(checkpoint['student'])
         print(f"=> loaded checkpoint (epoch {checkpoint.get('epoch', 'unknown')})")
