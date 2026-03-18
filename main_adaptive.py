@@ -292,10 +292,10 @@ class AdaptiveDINOLoss(nn.Module):
                  student_temp=0.1, center_momentum=0.9,
                  alpha_align=0.1, alpha_pressure=0.1,
                  align_warmup_init=0.0,
-                 align_warmup_start_epoch=30,
+                 align_warmup_start_epoch=10,
                  align_warmup_end_epoch=60,
                  align_warmup_mode="cosine",
-                 exit_tau=0.1, bce_pos_weight=1.0):
+                 ema_momentum=0.99, tau_percentile=0.5, bce_pos_weight=1.0):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
@@ -308,7 +308,12 @@ class AdaptiveDINOLoss(nn.Module):
         self.align_warmup_start_epoch = align_warmup_start_epoch
         self.align_warmup_end_epoch = align_warmup_end_epoch
         self.align_warmup_mode = align_warmup_mode
-        self.exit_tau = exit_tau
+
+        self.ema_momentum = ema_momentum
+        self.tau_percentile = tau_percentile
+        
+        self.register_buffer("loss_ema", torch.ones(num_layers))
+        self.register_buffer("_ema_initialized", torch.tensor(False))
 
         self.register_buffer("bce_pos_weight_tensor",
                              torch.tensor(float(bce_pos_weight), dtype=torch.float32))
@@ -330,6 +335,36 @@ class AdaptiveDINOLoss(nn.Module):
         t = (epoch - s) / float(e - s)
         w = t if self.align_warmup_mode == "linear" else 0.5 * (1.0 - math.cos(math.pi * t))
         return init + (target - init) * w
+
+    def _update_ema_and_get_targets(self, per_layer_losses, epoch):
+        """
+        레이어별 EMA 업데이트 후 동적 threshold 계산.
+        첫 번째 호출 시 EMA를 현재 값으로 초기화 (cold start 방지).
+        """
+        loss_device = per_layer_losses[0].device
+        loss_vals = torch.tensor(
+            [per_layer_losses[l].detach().item() for l in range(self.num_layers)],
+            device=self.loss_ema.device
+        )
+        
+        if not self._ema_initialized.item():
+            self.loss_ema.copy_(loss_vals)
+            self._ema_initialized.fill_(True)
+        else:
+            self.loss_ema = (self.ema_momentum * self.loss_ema 
+                            + (1 - self.ema_momentum) * loss_vals)
+        
+        # align_warmup과 연동하여 동적 percentile 계산
+        alpha_align_curr = self.get_alpha_align(epoch)
+        effective_percentile = self.tau_percentile * (
+            alpha_align_curr / self.alpha_align_target
+        ) if self.alpha_align_target > 0 else 0.0
+        
+        # 동적 threshold: 전체 레이어 EMA 중 하위 effective_percentile
+        threshold = torch.quantile(self.loss_ema, effective_percentile)
+        
+        targets = (loss_vals <= threshold).float()  # [num_layers]
+        return targets.to(loss_device), threshold.item()
 
     def forward(self, student_logits_per_layer, teacher_logits,
                 loss_predictor, loss_intermediates, epoch):
@@ -362,14 +397,16 @@ class AdaptiveDINOLoss(nn.Module):
 
         L_distill = sum(per_layer_losses)
 
+        # ── 동적 target 생성 ──
+        layer_targets, dynamic_threshold = self._update_ema_and_get_targets(per_layer_losses, epoch)
+
         # ② L_align (BCE) — [LOSS] 토큰 사용
         B_global = teacher_logits.shape[0]
         align_terms, pred_logits_det, target_det = [], [], []
         for l in range(self.num_layers):
             z_l = loss_intermediates[l][:B_global]                         # [2B, D]
             pred_logit_l = loss_predictor(z_l, l).view(-1)        # [2B]
-            target_val = 1.0 if per_layer_losses[l].detach().item() <= self.exit_tau else 0.0
-            target_l = torch.full_like(pred_logit_l, target_val)
+            target_l = torch.full_like(pred_logit_l, layer_targets[l].item())
             bce_l = F.binary_cross_entropy_with_logits(
                 pred_logit_l, target_l,
                 pos_weight=self.bce_pos_weight_tensor.to(pred_logit_l.device))
@@ -413,7 +450,8 @@ class AdaptiveDINOLoss(nn.Module):
             "L_pressure": L_pressure.item(), "total_loss": total_loss.item(),
             "alpha_align_curr": float(alpha_align_curr),
             "align_acc": align_acc.item(),
-            "target_pos_rate": tgt_all.mean().item(),
+            "target_pos_rate": layer_targets.mean().item(),
+            "dynamic_threshold": dynamic_threshold,
         }
         return total_loss, loss_dict
 
@@ -495,10 +533,11 @@ def get_args_parser():
     parser.add_argument('--alpha_align', default=0.1, type=float)
     parser.add_argument('--alpha_pressure', default=0.1, type=float)
     parser.add_argument('--align_warmup_init', default=0.0, type=float)
-    parser.add_argument('--align_warmup_start_epoch', default=30, type=int)
+    parser.add_argument('--align_warmup_start_epoch', default=10, type=int)
     parser.add_argument('--align_warmup_end_epoch', default=60, type=int)
     parser.add_argument('--align_warmup_mode', default='cosine', type=str, choices=['cosine', 'linear'])
-    parser.add_argument('--exit_tau', default=0.1, type=float)
+    parser.add_argument('--ema_momentum', default=0.99, type=float)
+    parser.add_argument('--tau_percentile', default=0.5, type=float)
     parser.add_argument('--bce_pos_weight', default=1.0, type=float)
     parser.add_argument('--early_exit_prob', default=0.5, type=float)
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float)
@@ -594,7 +633,8 @@ def train_adaptive(args):
         align_warmup_start_epoch=args.align_warmup_start_epoch,
         align_warmup_end_epoch=args.align_warmup_end_epoch,
         align_warmup_mode=args.align_warmup_mode,
-        exit_tau=args.exit_tau, bce_pos_weight=args.bce_pos_weight,
+        ema_momentum=args.ema_momentum, tau_percentile=args.tau_percentile,
+        bce_pos_weight=args.bce_pos_weight,
     ).to(device)
 
     # ── optimizer ──
