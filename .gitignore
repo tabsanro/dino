@@ -1,0 +1,4 @@
+cifar100_images/
+output*/
+*.pyc
+pytest*
