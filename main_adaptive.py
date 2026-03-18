@@ -2,16 +2,17 @@
 Hybrid Adaptive Vision Transformer — main_adaptive.py
 =====================================================
 Architecture:
-  - Independent Phase : num_indep_layers 개의 고유 가중치 Transformer Block
-  - Shared Phase      : 1개의 Block을 num_shared_recurrences 번 반복 (Recurrent)
-  - Decoupled Tokens  : [CLS](idx 0) + [LOSS](idx 1) 을 시퀀스 앞에 Concat
-  - Depth Embedding   : Shared Phase 루프마다 [LOSS] 토큰에만 깊이 임베딩을 더함
-  - Outputs           : Shared Phase 매 반복의 (cls_out, loss_out)을 수집·반환
+    - Independent Phase : 4개의 고유 가중치 Transformer Block
+    - Shared Phase      : 2개의 Block 세트를 num_shared_recurrences 번 반복 (Recurrent)
+    - Decoupled Tokens  : [CLS](idx 0) + [LOSS](idx 1) 을 시퀀스 앞에 Concat
+    - Depth Embedding   : Shared Phase 각 반복 시작 시 모든 토큰에 step embedding을 주입
+    - Outputs           : Shared Phase 매 반복의 (cls_out, loss_out)을 수집·반환
+    - DDP               : torchrun / distributed training 지원
 
 Usage:
-    python main_adaptive.py \
-        --data_path /path/to/imagefolder \
-        --num_indep_layers 6 --num_shared_recurrences 6 --epochs 100
+        torchrun --standalone --nproc_per_node=2 main_adaptive.py \
+                --data_path /path/to/imagefolder \
+        --num_indep_layers 4 --num_shared_recurrences 4 --epochs 100
 """
 import argparse
 import os
@@ -28,7 +29,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+import torch.backends.cudnn as cudnn
 from torchvision import datasets
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import utils
 from utils import trunc_normal_
@@ -40,15 +44,16 @@ from vision_transformer import Block, PatchEmbed, DINOHead
 # ═════════════════════════════════════════════════════════════════════════════
 class HybridAdaptiveVisionTransformer(nn.Module):
     """
-    전반부: Independent Phase  (각각 고유 가중치를 갖는 Block × num_indep_layers)
-    후반부: Shared Phase       (단 1개 Block 인스턴스 × num_shared_recurrences 반복)
+    전반부: Independent Phase  (4개의 고유 가중치를 갖는 Block)
+    후반부: Shared Phase       (2개 Block 인스턴스 × num_shared_recurrences 반복)
 
     Decoupled tokens:
         idx 0 → [CLS]  : DINO 증류 손실용 의미론적 특징
         idx 1 → [LOSS] : Early-Exit / Efficiency Pressure / 깊이 인지
 
     Depth embedding:
-        Shared Phase 루프마다 [LOSS] 토큰에만 depth_embeds[l] 을 더한다.
+        Shared Phase 각 반복 시작과 종료에 recurrence-specific step embedding을
+        모든 토큰에 broadcast하여 더한다.
     """
 
     def __init__(
@@ -65,14 +70,14 @@ class HybridAdaptiveVisionTransformer(nn.Module):
         attn_drop_rate: float = 0.0,
         drop_path_rate: float = 0.1,
         norm_layer=None,
-        num_indep_layers: int = 6,
-        num_shared_recurrences: int = 6,
+        num_indep_layers: int = 4,
+        num_shared_recurrences: int = 4,
         **kwargs,
     ):
         super().__init__()
         norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
         self.num_features = self.embed_dim = embed_dim
-        self.num_indep_layers = num_indep_layers
+        self.num_indep_layers = 4
         self.num_shared_recurrences = num_shared_recurrences
 
         # ── Patch Embedding ──
@@ -89,8 +94,8 @@ class HybridAdaptiveVisionTransformer(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 2, embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
 
-        # ── Independent Phase: 고유 가중치 Block 리스트 ──
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, num_indep_layers + 1)]
+        # ── Independent Phase: 고유 가중치 Block 리스트 (4개 고정) ──
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, 6)]
         self.indep_blocks = nn.ModuleList([
             Block(
                 dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -98,16 +103,19 @@ class HybridAdaptiveVisionTransformer(nn.Module):
                 attn_drop=attn_drop_rate, drop_path=dpr[i],
                 norm_layer=norm_layer,
             )
-            for i in range(num_indep_layers)
+            for i in range(self.num_indep_layers)
         ])
 
-        # ── Shared Phase: 단일 Block 인스턴스 (반복 사용) ──
-        self.shared_block = Block(
-            dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
-            qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
-            attn_drop=attn_drop_rate, drop_path=dpr[-1],
-            norm_layer=norm_layer,
-        )
+        # ── Shared Phase: 2개 Block 인스턴스로 구성된 재사용 세트 ──
+        self.shared_blocks = nn.ModuleList([
+            Block(
+                dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio,
+                qkv_bias=qkv_bias, qk_scale=qk_scale, drop=drop_rate,
+                attn_drop=attn_drop_rate, drop_path=dpr[4 + i],
+                norm_layer=norm_layer,
+            )
+            for i in range(2)
+        ])
 
         # ── Shared Phase 출력 정규화 (깊이별 분포가 다르므로 공유하지 않음) ──
         self.shared_norms = nn.ModuleList([
@@ -115,6 +123,8 @@ class HybridAdaptiveVisionTransformer(nn.Module):
         ])
 
         # ── Global Depth Positional Embedding ──
+        # Broadcast across the full token sequence so [CLS], [LOSS], and patches
+        # all receive the same recurrence-specific step signal.
         self.global_depth_embeds = nn.Parameter(
             torch.zeros(self.num_shared_recurrences, 1, 1, embed_dim)
         )
@@ -194,8 +204,10 @@ class HybridAdaptiveVisionTransformer(nn.Module):
         cls_intermediates  = []
         loss_intermediates = []
         for l in range(self.num_shared_recurrences):
-            x = x + self.global_depth_embeds[l]
-            x = self.shared_block(x)              # [B, 2+P, D]
+            step_embed = self.global_depth_embeds[l]
+            x = x + step_embed
+            for shared_blk in self.shared_blocks:
+                x = shared_blk(x)              # [B, 2+P, D]
             normed = self.shared_norms[l](x)
 
             cls_out  = normed[:, 0]
@@ -207,7 +219,7 @@ class HybridAdaptiveVisionTransformer(nn.Module):
         return cls_intermediates, loss_intermediates
 
     # --------------------------------------------------------------------- #
-    def forward_inference(self, images, loss_predictor, heads, exit_prob=0.5):
+    def forward_inference(self, images, loss_predictor, head, exit_prob=0.5):
         """
         인퍼런스 시 Early Exit: [LOSS] 토큰의 예측 확률이 exit_prob 이상이면 종료.
         Returns:
@@ -222,8 +234,10 @@ class HybridAdaptiveVisionTransformer(nn.Module):
 
         # Shared Phase with Early Exit
         for l in range(self.num_shared_recurrences):
-            x = x + self.global_depth_embeds[l]
-            x = self.shared_block(x)              # [B, 2+P, D]
+            step_embed = self.global_depth_embeds[l]
+            x = x + step_embed
+            for shared_blk in self.shared_blocks:
+                x = shared_blk(x)              # [B, 2+P, D]
             normed = self.shared_norms[l](x)
 
             cls_out  = normed[:, 0]
@@ -234,10 +248,10 @@ class HybridAdaptiveVisionTransformer(nn.Module):
                 pred_prob  = torch.sigmoid(pred_logit)       # [B]
 
             if torch.all(pred_prob >= exit_prob):
-                logits = heads[l](cls_out)
+                logits = head(cls_out)
                 return logits, l
 
-        logits = heads[-1](cls_out)
+        logits = head(cls_out)
         return logits, self.num_shared_recurrences - 1
 
 
@@ -283,10 +297,15 @@ class AdaptiveDINOLoss(nn.Module):
                  student_temp=0.1, center_momentum=0.9,
                  alpha_align=0.1, alpha_pressure=0.1,
                  align_warmup_init=0.0,
-                 align_warmup_start_epoch=10,
-                 align_warmup_end_epoch=60,
+                 align_warmup_start_epoch=None,
+                 align_warmup_end_epoch=None,
                  align_warmup_mode="cosine",
-                 ema_momentum=0.99, tau_percentile=0.5, bce_pos_weight=1.0):
+                 pressure_warmup_init=0.0,
+                 pressure_warmup_start_epoch=None,
+                 pressure_warmup_end_epoch=None,
+                 pressure_warmup_mode="cosine",
+                 ema_momentum=0.99, tau_percentile=0.5, bce_pos_weight=1.0,
+                 distill_mode="last_only"):
         super().__init__()
         self.student_temp = student_temp
         self.center_momentum = center_momentum
@@ -294,14 +313,19 @@ class AdaptiveDINOLoss(nn.Module):
         self.num_layers = num_layers
 
         self.alpha_align_target = alpha_align
-        self.alpha_pressure = alpha_pressure
+        self.alpha_pressure_target = alpha_pressure
         self.align_warmup_init = align_warmup_init
-        self.align_warmup_start_epoch = align_warmup_start_epoch
-        self.align_warmup_end_epoch = align_warmup_end_epoch
+        self.align_warmup_start_epoch = nepochs // 2 if align_warmup_start_epoch is None else align_warmup_start_epoch
+        self.align_warmup_end_epoch = nepochs - 1 if align_warmup_end_epoch is None else align_warmup_end_epoch
         self.align_warmup_mode = align_warmup_mode
+        self.pressure_warmup_init = pressure_warmup_init
+        self.pressure_warmup_start_epoch = nepochs // 2 if pressure_warmup_start_epoch is None else pressure_warmup_start_epoch
+        self.pressure_warmup_end_epoch = nepochs - 1 if pressure_warmup_end_epoch is None else pressure_warmup_end_epoch
+        self.pressure_warmup_mode = pressure_warmup_mode
 
         self.ema_momentum = ema_momentum
         self.tau_percentile = tau_percentile
+        self.distill_mode = distill_mode
         
         self.register_buffer("loss_ema", torch.ones(num_layers))
         self.register_buffer("_ema_initialized", torch.tensor(False))
@@ -314,18 +338,49 @@ class AdaptiveDINOLoss(nn.Module):
             np.ones(nepochs - warmup_teacher_temp_epochs) * teacher_temp,
         ))
 
+    def _get_distill_weights(self, device):
+        if self.distill_mode == "none":
+            return torch.zeros(self.num_layers, device=device)
+        if self.distill_mode == "last_only":
+            weights = torch.zeros(self.num_layers, device=device)
+            weights[-1] = 1.0
+            return weights
+        if self.distill_mode == "linear":
+            weights = torch.linspace(0.1, 1.0, self.num_layers, device=device)
+            return weights / weights.sum()
+        raise ValueError(f"Unknown distill_mode: {self.distill_mode}")
+
+    def _warmup_value(self, epoch: int, start_epoch: int, end_epoch: int,
+                      init_value: float, target_value: float, mode: str) -> float:
+        if end_epoch <= start_epoch:
+            return target_value if epoch >= start_epoch else init_value
+        if epoch < start_epoch:
+            return init_value
+        if epoch >= end_epoch:
+            return target_value
+        t = (epoch - start_epoch) / float(end_epoch - start_epoch)
+        w = t if mode == "linear" else 0.5 * (1.0 - math.cos(math.pi * t))
+        return init_value + (target_value - init_value) * w
+
     def get_alpha_align(self, epoch: int) -> float:
-        s, e = self.align_warmup_start_epoch, self.align_warmup_end_epoch
-        init, target = self.align_warmup_init, self.alpha_align_target
-        if e <= s:
-            return target if epoch >= s else init
-        if epoch < s:
-            return init
-        if epoch >= e:
-            return target
-        t = (epoch - s) / float(e - s)
-        w = t if self.align_warmup_mode == "linear" else 0.5 * (1.0 - math.cos(math.pi * t))
-        return init + (target - init) * w
+        return self._warmup_value(
+            epoch,
+            self.align_warmup_start_epoch,
+            self.align_warmup_end_epoch,
+            self.align_warmup_init,
+            self.alpha_align_target,
+            self.align_warmup_mode,
+        )
+
+    def get_alpha_pressure(self, epoch: int) -> float:
+        return self._warmup_value(
+            epoch,
+            self.pressure_warmup_start_epoch,
+            self.pressure_warmup_end_epoch,
+            self.pressure_warmup_init,
+            self.alpha_pressure_target,
+            self.pressure_warmup_mode,
+        )
 
     def _update_ema_and_get_targets(self, inst_losses, epoch):
         """
@@ -333,6 +388,10 @@ class AdaptiveDINOLoss(nn.Module):
         """
         loss_device = inst_losses.device
         loss_vals_mean = inst_losses.mean(dim=1).detach()
+
+        if utils.get_world_size() > 1:
+            dist.all_reduce(loss_vals_mean)
+            loss_vals_mean /= utils.get_world_size()
         
         self.loss_ema = self.loss_ema.to(loss_device)
         
@@ -400,10 +459,10 @@ class AdaptiveDINOLoss(nn.Module):
             per_layer_losses_mean.append(layer_loss_mean / n_terms)
             per_layer_losses_inst.append(layer_loss_inst / inst_terms)
 
-        # 수정: 마지막 레이어가 주 학습 신호, 앞 레이어는 보조
-        layer_weights = torch.linspace(0.1, 1.0, self.num_layers)  # [0.1, 0.28, ... , 1.0]
-        layer_weights = layer_weights / layer_weights.sum()  # 합이 1이 되도록 정규화
-        L_distill = sum(w * loss for w, loss in zip(layer_weights, per_layer_losses_mean))
+        layer_weights = self._get_distill_weights(teacher_logits.device)
+        L_distill = torch.zeros((), device=teacher_logits.device, dtype=teacher_logits.dtype)
+        for w, loss in zip(layer_weights, per_layer_losses_mean):
+            L_distill = L_distill + w * loss
 
         inst_losses = torch.stack(per_layer_losses_inst) # [num_layers, B]
 
@@ -461,8 +520,7 @@ class AdaptiveDINOLoss(nn.Module):
         L_pressure = ((exit_dist * depths).sum(dim=1) / L).mean()
 
         alpha_align_curr = self.get_alpha_align(epoch)
-        # alpha_align이 웜업 중일 때 pressure도 가해지지 않도록 동기화 (Reward Hacking 방지)
-        alpha_pressure_curr = self.alpha_pressure * (alpha_align_curr / self.alpha_align_target) if self.alpha_align_target > 0 else 0.0
+        alpha_pressure_curr = self.get_alpha_pressure(epoch)
         total_loss = L_distill + alpha_align_curr * L_align + alpha_pressure_curr * L_pressure
 
         self.update_center(teacher_logits)
@@ -476,6 +534,7 @@ class AdaptiveDINOLoss(nn.Module):
             "L_distill": L_distill.item(), "L_align": L_align.item(),
             "L_pressure": L_pressure.item(), "total_loss": total_loss.item(),
             "alpha_align_curr": float(alpha_align_curr),
+            "alpha_pressure_curr": float(alpha_pressure_curr),
             "align_acc": align_acc.item(),
             "target_pos_rate": layer_targets.mean().item(),
             "dynamic_threshold_avg": sum(dynamic_thresholds) / len(dynamic_thresholds),
@@ -487,7 +546,10 @@ class AdaptiveDINOLoss(nn.Module):
 
     @torch.no_grad()
     def update_center(self, teacher_output):
-        batch_center = torch.mean(teacher_output, dim=0, keepdim=True)
+        batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
+        if utils.get_world_size() > 1:
+            dist.all_reduce(batch_center)
+        batch_center = batch_center / (len(teacher_output) * utils.get_world_size())
         self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
 
 
@@ -502,7 +564,7 @@ class AdaptiveMultiCropWrapper(nn.Module):
     def __init__(self, backbone, heads, loss_predictor):
         super().__init__()
         self.backbone = backbone
-        self.heads = heads                # nn.ModuleList of DINOHead
+        self.heads = heads                # single shared DINOHead
         self.loss_predictor = loss_predictor
 
     def forward(self, x):
@@ -535,7 +597,7 @@ class AdaptiveMultiCropWrapper(nn.Module):
         cls_intermediates  = [torch.cat(feats, dim=0) for feats in all_cls]
         loss_intermediates = [torch.cat(feats, dim=0) for feats in all_loss]
 
-        logits_per_layer = [self.heads[l](cls_intermediates[l]) for l in range(num_layers)]
+        logits_per_layer = [self.heads(cls_intermediates[l]) for l in range(num_layers)]
 
         return logits_per_layer, loss_intermediates
 
@@ -550,10 +612,10 @@ def get_args_parser():
     parser.add_argument('--embed_dim', default=384, type=int)
     parser.add_argument('--num_heads', default=6, type=int)
     parser.add_argument('--patch_size', default=16, type=int)
-    parser.add_argument('--num_indep_layers', default=6, type=int,
-        help='Number of independent (unique-weight) transformer blocks.')
-    parser.add_argument('--num_shared_recurrences', default=6, type=int,
-        help='Number of recurrences of the single shared block.')
+    parser.add_argument('--num_indep_layers', default=4, type=int,
+        help='Number of independent (unique-weight) transformer blocks. Fixed to 4 in the 4+2 design.')
+    parser.add_argument('--num_shared_recurrences', default=4, type=int,
+        help='Number of recurrences of the shared 2-block phase.')
     parser.add_argument('--out_dim', default=4096, type=int)
     parser.add_argument('--norm_last_layer', default=True, type=utils.bool_flag)
     parser.add_argument('--use_bn_in_head', default=False, type=utils.bool_flag)
@@ -563,12 +625,19 @@ def get_args_parser():
     parser.add_argument('--alpha_align', default=0.1, type=float)
     parser.add_argument('--alpha_pressure', default=0.1, type=float)
     parser.add_argument('--align_warmup_init', default=0.0, type=float)
-    parser.add_argument('--align_warmup_start_epoch', default=10, type=int)
-    parser.add_argument('--align_warmup_end_epoch', default=60, type=int)
+    parser.add_argument('--align_warmup_start_epoch', default=None, type=int)
+    parser.add_argument('--align_warmup_end_epoch', default=None, type=int)
     parser.add_argument('--align_warmup_mode', default='cosine', type=str, choices=['cosine', 'linear'])
+    parser.add_argument('--pressure_warmup_init', default=0.0, type=float)
+    parser.add_argument('--pressure_warmup_start_epoch', default=None, type=int)
+    parser.add_argument('--pressure_warmup_end_epoch', default=None, type=int)
+    parser.add_argument('--pressure_warmup_mode', default='cosine', type=str, choices=['cosine', 'linear'])
     parser.add_argument('--ema_momentum', default=0.99, type=float)
     parser.add_argument('--tau_percentile', default=0.5, type=float)
     parser.add_argument('--bce_pos_weight', default=1.0, type=float)
+    parser.add_argument('--distill_mode', default='last_only', type=str,
+        choices=['none', 'last_only', 'linear'],
+        help='How to weight L_distill across shared recurrences.')
     parser.add_argument('--early_exit_prob', default=0.5, type=float)
     parser.add_argument('--warmup_teacher_temp', default=0.04, type=float)
     parser.add_argument('--teacher_temp', default=0.04, type=float)
@@ -600,6 +669,8 @@ def get_args_parser():
     parser.add_argument('--saveckp_freq', default=20, type=int)
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--num_workers', default=10, type=int)
+    parser.add_argument('--dist_url', default='env://', type=str)
+    parser.add_argument('--local_rank', default=0, type=int)
     return parser
 
 
@@ -607,21 +678,22 @@ def get_args_parser():
 # 6. Training
 # ═════════════════════════════════════════════════════════════════════════════
 def train_adaptive(args):
+    utils.init_distributed_mode(args)
     utils.fix_random_seeds(args.seed)
     print("git:\n  {}\n".format(utils.get_sha()))
     print("\n".join("%s: %s" % (k, str(v)) for k, v in sorted(vars(args).items())))
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
-        torch.backends.cudnn.benchmark = True
+    cudnn.benchmark = True
+    device = torch.device("cuda", args.gpu)
 
     # ── data ──
     from main_dino import DataAugmentationDINO
     transform = DataAugmentationDINO(
         args.global_crops_scale, args.local_crops_scale, args.local_crops_number)
     dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
-        dataset, shuffle=True, batch_size=args.batch_size_per_gpu,
+        dataset, sampler=sampler, shuffle=False, batch_size=args.batch_size_per_gpu,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"), drop_last=True)
     print(f"Data loaded: {len(dataset)} images.")
 
@@ -637,20 +709,34 @@ def train_adaptive(args):
             drop_path_rate=args.drop_path_rate,
             num_indep_layers=args.num_indep_layers,
             num_shared_recurrences=num_shared)
-        heads = nn.ModuleList([
-            DINOHead(embed_dim, args.out_dim,
-                     use_bn=args.use_bn_in_head,
-                     norm_last_layer=args.norm_last_layer if l == num_shared - 1 else True)
-            for l in range(num_shared)])
+        heads = DINOHead(
+            embed_dim, args.out_dim,
+            use_bn=args.use_bn_in_head,
+            norm_last_layer=args.norm_last_layer,
+        )
         predictor = LossPredictor(embed_dim, num_shared)
         return AdaptiveMultiCropWrapper(backbone, heads, predictor)
 
     student = _build_model().to(device)
     teacher = _build_model().to(device)
-    teacher.load_state_dict(student.state_dict())
+    has_bn = utils.has_batchnorms(student)
+    if has_bn:
+        student = nn.SyncBatchNorm.convert_sync_batchnorm(student)
+        teacher = nn.SyncBatchNorm.convert_sync_batchnorm(teacher)
+
+    student = DDP(student, device_ids=[args.gpu])
+    student_without_ddp = student.module
+
+    if has_bn:
+        teacher = DDP(teacher, device_ids=[args.gpu])
+        teacher_without_ddp = teacher.module
+    else:
+        teacher_without_ddp = teacher
+
+    teacher_without_ddp.load_state_dict(student_without_ddp.state_dict())
     for p in teacher.parameters():
         p.requires_grad = False
-    print(f"Hybrid model built: indep={args.num_indep_layers}, shared={num_shared}, "
+    print(f"Hybrid model built: indep=4, shared={num_shared}, "
           f"embed_dim={embed_dim}, device={device}")
 
     # ── loss ──
@@ -663,14 +749,19 @@ def train_adaptive(args):
         align_warmup_start_epoch=args.align_warmup_start_epoch,
         align_warmup_end_epoch=args.align_warmup_end_epoch,
         align_warmup_mode=args.align_warmup_mode,
+        pressure_warmup_init=args.pressure_warmup_init,
+        pressure_warmup_start_epoch=args.pressure_warmup_start_epoch,
+        pressure_warmup_end_epoch=args.pressure_warmup_end_epoch,
+        pressure_warmup_mode=args.pressure_warmup_mode,
         ema_momentum=args.ema_momentum, tau_percentile=args.tau_percentile,
         bce_pos_weight=args.bce_pos_weight,
+        distill_mode=args.distill_mode,
     ).to(device)
 
     # ── optimizer ──
-    backbone_params = list(student.backbone.parameters())
-    head_params = list(student.heads.parameters())
-    predictor_params = list(student.loss_predictor.parameters())
+    backbone_params = list(student_without_ddp.backbone.parameters())
+    head_params = list(student_without_ddp.heads.parameters())
+    predictor_params = list(student_without_ddp.loss_predictor.parameters())
     params_groups = [
         {"params": [p for p in backbone_params if p.requires_grad and p.ndim >= 2],
          "weight_decay": args.weight_decay},
@@ -692,7 +783,7 @@ def train_adaptive(args):
 
     # ── schedulers ──
     lr_schedule = utils.cosine_scheduler(
-        args.lr * args.batch_size_per_gpu / 256., args.min_lr,
+        args.lr * args.batch_size_per_gpu * utils.get_world_size() / 256., args.min_lr,
         args.epochs, len(data_loader), warmup_epochs=args.warmup_epochs)
     wd_schedule = utils.cosine_scheduler(
         args.weight_decay, args.weight_decay_end, args.epochs, len(data_loader))
@@ -702,19 +793,42 @@ def train_adaptive(args):
 
     # ── resume ──
     to_restore = {"epoch": 0}
-    utils.restart_from_checkpoint(
-        os.path.join(args.output_dir, "checkpoint.pth"),
-        run_variables=to_restore,
-        student=student, teacher=teacher, optimizer=optimizer,
-        fp16_scaler=fp16_scaler, adaptive_loss=adaptive_loss)
+    ckp_path = os.path.join(args.output_dir, "checkpoint.pth")
+    if os.path.isfile(ckp_path):
+        checkpoint = torch.load(ckp_path, map_location="cpu", weights_only=False)
+
+        def _normalize_state_dict(state_dict, module):
+            if not isinstance(state_dict, dict) or len(state_dict) == 0:
+                return state_dict
+            has_module_prefix = all(k.startswith("module.") for k in state_dict.keys())
+            module_is_wrapped = isinstance(module, DDP)
+            if has_module_prefix and not module_is_wrapped:
+                return {k.replace("module.", "", 1): v for k, v in state_dict.items()}
+            if module_is_wrapped and not has_module_prefix:
+                return {f"module.{k}": v for k, v in state_dict.items()}
+            return state_dict
+
+        if "student" in checkpoint:
+            student.load_state_dict(_normalize_state_dict(checkpoint["student"], student), strict=False)
+        if "teacher" in checkpoint:
+            teacher.load_state_dict(_normalize_state_dict(checkpoint["teacher"], teacher), strict=False)
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        if fp16_scaler is not None and "fp16_scaler" in checkpoint:
+            fp16_scaler.load_state_dict(checkpoint["fp16_scaler"])
+        if "adaptive_loss" in checkpoint:
+            adaptive_loss.load_state_dict(checkpoint["adaptive_loss"], strict=False)
+        if "epoch" in checkpoint:
+            to_restore["epoch"] = checkpoint["epoch"]
     start_epoch = to_restore["epoch"]
 
     # ── train loop ──
     start_time = time.time()
     print("Starting Hybrid SPAE training!")
     for epoch in range(start_epoch, args.epochs):
+        sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
-            student, teacher, adaptive_loss, data_loader,
+            student, teacher, student_without_ddp, teacher_without_ddp, adaptive_loss, data_loader,
             optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args, device)
 
@@ -738,7 +852,7 @@ def train_adaptive(args):
     print('Training time {}'.format(str(datetime.timedelta(seconds=int(total_time)))))
 
 
-def train_one_epoch(student, teacher, adaptive_loss, data_loader,
+def train_one_epoch(student, teacher, student_without_ddp, teacher_without_ddp, adaptive_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,
                     epoch, fp16_scaler, args, device):
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -764,7 +878,7 @@ def train_one_epoch(student, teacher, adaptive_loss, data_loader,
 
             loss, loss_dict = adaptive_loss(
                 logits_per_layer, teacher_logits,
-                student.loss_predictor, loss_intermediates, epoch)
+                student_without_ddp.loss_predictor, loss_intermediates, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()))
@@ -787,7 +901,7 @@ def train_one_epoch(student, teacher, adaptive_loss, data_loader,
         # EMA update
         with torch.no_grad():
             m = momentum_schedule[global_it]
-            for param_q, param_k in zip(student.parameters(), teacher.parameters()):
+            for param_q, param_k in zip(student_without_ddp.parameters(), teacher_without_ddp.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
         if device.type == "cuda":
@@ -798,6 +912,8 @@ def train_one_epoch(student, teacher, adaptive_loss, data_loader,
         metric_logger.update(L_pressure=loss_dict["L_pressure"])
         if "alpha_align_curr" in loss_dict:
             metric_logger.update(alpha_align=loss_dict["alpha_align_curr"])
+        if "alpha_pressure_curr" in loss_dict:
+            metric_logger.update(alpha_pressure=loss_dict["alpha_pressure_curr"])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if global_it % 50 == 0 and utils.is_main_process():
@@ -814,8 +930,9 @@ def inference_with_early_exit(model, images, threshold=0.5):
     """threshold: sigmoid(logit) >= 값이면 exit."""
     model.eval()
     with torch.no_grad():
-        logits, exit_layer = model.backbone.forward_inference(
-            images, model.loss_predictor, model.heads, exit_prob=threshold)
+        wrapped = model.module if hasattr(model, "module") else model
+        logits, exit_layer = wrapped.backbone.forward_inference(
+            images, wrapped.loss_predictor, wrapped.heads, exit_prob=threshold)
     return logits, exit_layer
 
 
