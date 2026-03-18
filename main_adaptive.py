@@ -34,11 +34,6 @@ import utils
 from utils import trunc_normal_
 from vision_transformer import Block, PatchEmbed, DINOHead
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:  # pragma: no cover - optional dependency
-    SummaryWriter = None
-
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. Hybrid Adaptive Vision Transformer
@@ -199,16 +194,16 @@ class HybridAdaptiveVisionTransformer(nn.Module):
         # ── Shared (Recurrent) Phase ──
         cls_intermediates  = []
         loss_intermediates = []
-        for layer_idx in range(self.num_shared_recurrences):
+        for l in range(self.num_shared_recurrences):
             # In-place 수정을 피하기 위해 새로운 텐서를 생성하여 Re-assemble
             cls_t = x[:, 0:1, :]
-            loss_t = x[:, 1:2, :] + self.depth_embeds[layer_idx].view(1, 1, -1)
+            loss_t = x[:, 1:2, :] + self.depth_embeds[l].view(1, 1, -1)
             patch_t = x[:, 2:, :]
             x = torch.cat([cls_t, loss_t, patch_t], dim=1)
 
             x = self.shared_block(x)                        # [B, 2+P, D]
 
-            normed = self.shared_norms[layer_idx](x)        # [B, 2+P, D]
+            normed = self.shared_norms[l](x)                # [B, 2+P, D]
             cls_out  = normed[:, 0]                         # [B, D]
             loss_out = normed[:, 1]                         # [B, D]
 
@@ -232,24 +227,24 @@ class HybridAdaptiveVisionTransformer(nn.Module):
             x = blk(x)
 
         # Shared Phase with Early Exit
-        for layer_idx in range(self.num_shared_recurrences):
+        for l in range(self.num_shared_recurrences):
             cls_t = x[:, 0:1, :]
-            loss_t = x[:, 1:2, :] + self.depth_embeds[layer_idx].view(1, 1, -1)
+            loss_t = x[:, 1:2, :] + self.depth_embeds[l].view(1, 1, -1)
             patch_t = x[:, 2:, :]
             x = torch.cat([cls_t, loss_t, patch_t], dim=1)
 
             x = self.shared_block(x)
-            normed = self.shared_norms[layer_idx](x)
+            normed = self.shared_norms[l](x)
             cls_out  = normed[:, 0]                         # [B, D]
             loss_out = normed[:, 1]                         # [B, D]
 
             with torch.no_grad():
-                pred_logit = loss_predictor(loss_out, layer_idx)  # [B]
+                pred_logit = loss_predictor(loss_out, l)     # [B]
                 pred_prob  = torch.sigmoid(pred_logit)       # [B]
 
             if torch.all(pred_prob >= exit_prob):
-                logits = heads[layer_idx](cls_out)
-                return logits, layer_idx
+                logits = heads[l](cls_out)
+                return logits, l
 
         logits = heads[-1](cls_out)
         return logits, self.num_shared_recurrences - 1
@@ -348,7 +343,7 @@ class AdaptiveDINOLoss(nn.Module):
         """
         loss_device = per_layer_losses[0].device
         loss_vals = torch.tensor(
-            [per_layer_losses[layer_idx].detach().item() for layer_idx in range(self.num_layers)],
+            [per_layer_losses[l].detach().item() for l in range(self.num_layers)],
             device=self.loss_ema.device
         )
         
@@ -387,8 +382,8 @@ class AdaptiveDINOLoss(nn.Module):
 
         # ① L_distill
         per_layer_losses = []
-        for layer_idx in range(self.num_layers):
-            s_out = student_logits_per_layer[layer_idx] / self.student_temp
+        for l in range(self.num_layers):
+            s_out = student_logits_per_layer[l] / self.student_temp
             s_out = s_out.chunk(self.ncrops)
             layer_loss, n_terms = 0.0, 0
             for iq, q in enumerate(teacher_out):
@@ -408,10 +403,10 @@ class AdaptiveDINOLoss(nn.Module):
         # ② L_align (BCE) — [LOSS] 토큰 사용
         B_global = teacher_logits.shape[0]
         align_terms, pred_logits_det, target_det = [], [], []
-        for layer_idx in range(self.num_layers):
-            z_l = loss_intermediates[layer_idx][:B_global]                 # [2B, D]
-            pred_logit_l = loss_predictor(z_l, layer_idx).view(-1)         # [2B]
-            target_l = torch.full_like(pred_logit_l, layer_targets[layer_idx].item())
+        for l in range(self.num_layers):
+            z_l = loss_intermediates[l][:B_global]                         # [2B, D]
+            pred_logit_l = loss_predictor(z_l, l).view(-1)        # [2B]
+            target_l = torch.full_like(pred_logit_l, layer_targets[l].item())
             bce_l = F.binary_cross_entropy_with_logits(
                 pred_logit_l, target_l,
                 pos_weight=self.bce_pos_weight_tensor.to(pred_logit_l.device))
@@ -423,9 +418,9 @@ class AdaptiveDINOLoss(nn.Module):
 
         # ③ L_pressure — expected depth 최소화
         prob_layers = []
-        for layer_idx in range(self.num_layers):
-            z_l = loss_intermediates[layer_idx][:B_global]
-            pred_logit_l = loss_predictor(z_l, layer_idx).view(-1)
+        for l in range(self.num_layers):
+            z_l = loss_intermediates[l][:B_global]
+            pred_logit_l = loss_predictor(z_l, l).view(-1)
             prob_layers.append(torch.sigmoid(pred_logit_l))
         p = torch.stack(prob_layers, dim=1)                                # [2B, L]
         B_p, L = p.shape
@@ -502,15 +497,15 @@ class AdaptiveMultiCropWrapper(nn.Module):
         for end_idx in idx_crops:
             batch = torch.cat(x[start_idx:end_idx])
             cls_outs, loss_outs = self.backbone(batch)  # lists of [B_chunk, D]
-            for layer_idx in range(num_layers):
-                all_cls[layer_idx].append(cls_outs[layer_idx])
-                all_loss[layer_idx].append(loss_outs[layer_idx])
+            for l in range(num_layers):
+                all_cls[l].append(cls_outs[l])
+                all_loss[l].append(loss_outs[l])
             start_idx = end_idx
 
         cls_intermediates  = [torch.cat(feats, dim=0) for feats in all_cls]
         loss_intermediates = [torch.cat(feats, dim=0) for feats in all_loss]
 
-        logits_per_layer = [self.heads[layer_idx](cls_intermediates[layer_idx]) for layer_idx in range(num_layers)]
+        logits_per_layer = [self.heads[l](cls_intermediates[l]) for l in range(num_layers)]
 
         return logits_per_layer, loss_intermediates
 
@@ -572,8 +567,6 @@ def get_args_parser():
     # ── Misc ──
     parser.add_argument('--data_path', default='./cifar100_images/train', type=str)
     parser.add_argument('--output_dir', default='./output_adaptive_hybrid', type=str)
-    parser.add_argument('--tensorboard_log_dir', default='', type=str,
-                        help='TensorBoard log directory. Empty uses <output_dir>/tensorboard.')
     parser.add_argument('--saveckp_freq', default=20, type=int)
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--num_workers', default=10, type=int)
@@ -591,15 +584,6 @@ def train_adaptive(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda" and hasattr(torch.backends, "cudnn"):
         torch.backends.cudnn.benchmark = True
-
-    tb_log_dir = Path(args.tensorboard_log_dir) if args.tensorboard_log_dir else Path(args.output_dir) / "tensorboard"
-    tb_writer = None
-    if SummaryWriter is not None and utils.is_main_process():
-        tb_log_dir.mkdir(parents=True, exist_ok=True)
-        tb_writer = SummaryWriter(log_dir=str(tb_log_dir))
-        print(f"TensorBoard logs: {tb_log_dir}")
-    elif SummaryWriter is None and utils.is_main_process():
-        print("TensorBoard is unavailable because torch.utils.tensorboard could not be imported.")
 
     # ── data ──
     from main_dino import DataAugmentationDINO
@@ -626,8 +610,8 @@ def train_adaptive(args):
         heads = nn.ModuleList([
             DINOHead(embed_dim, args.out_dim,
                      use_bn=args.use_bn_in_head,
-                     norm_last_layer=args.norm_last_layer if layer_idx == num_shared - 1 else True)
-            for layer_idx in range(num_shared)])
+                     norm_last_layer=args.norm_last_layer if l == num_shared - 1 else True)
+            for l in range(num_shared)])
         predictor = LossPredictor(embed_dim, num_shared)
         return AdaptiveMultiCropWrapper(backbone, heads, predictor)
 
@@ -702,7 +686,7 @@ def train_adaptive(args):
         train_stats = train_one_epoch(
             student, teacher, adaptive_loss, data_loader,
             optimizer, lr_schedule, wd_schedule, momentum_schedule,
-            epoch, fp16_scaler, args, device, tb_writer)
+            epoch, fp16_scaler, args, device)
 
         save_dict = {
             'student': student.state_dict(), 'teacher': teacher.state_dict(),
@@ -719,12 +703,6 @@ def train_adaptive(args):
         if utils.is_main_process():
             with (Path(args.output_dir) / "log.txt").open("a") as f:
                 f.write(json.dumps(log_stats) + "\n")
-            if tb_writer is not None:
-                for key, value in train_stats.items():
-                    tb_writer.add_scalar(f"train/{key}", value, epoch)
-
-    if tb_writer is not None:
-        tb_writer.close()
 
     total_time = time.time() - start_time
     print('Training time {}'.format(str(datetime.timedelta(seconds=int(total_time)))))
@@ -732,7 +710,7 @@ def train_adaptive(args):
 
 def train_one_epoch(student, teacher, adaptive_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,
-                    epoch, fp16_scaler, args, device, tb_writer=None):
+                    epoch, fp16_scaler, args, device):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
 
@@ -796,17 +774,6 @@ def train_one_epoch(student, teacher, adaptive_loss, data_loader,
             if "align_acc" in loss_dict:
                 print(f"  [BCE Predictor] acc={loss_dict['align_acc']:.4f}, "
                       f"target_pos_rate={loss_dict.get('target_pos_rate', -1):.4f}")
-
-        if tb_writer is not None and utils.is_main_process():
-            tb_writer.add_scalar("train_step/total_loss", loss_dict["total_loss"], global_it)
-            tb_writer.add_scalar("train_step/L_distill", loss_dict["L_distill"], global_it)
-            tb_writer.add_scalar("train_step/L_align", loss_dict["L_align"], global_it)
-            tb_writer.add_scalar("train_step/L_pressure", loss_dict["L_pressure"], global_it)
-            tb_writer.add_scalar("train_step/lr", optimizer.param_groups[0]["lr"], global_it)
-            if "alpha_align_curr" in loss_dict:
-                tb_writer.add_scalar("train_step/alpha_align", loss_dict["alpha_align_curr"], global_it)
-            if "align_acc" in loss_dict:
-                tb_writer.add_scalar("train_step/align_acc", loss_dict["align_acc"], global_it)
 
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
