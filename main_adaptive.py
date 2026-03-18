@@ -40,12 +40,6 @@ except ImportError:  # pragma: no cover - optional dependency
     SummaryWriter = None
 
 
-def unwrap_model(model):
-    if isinstance(model, nn.DataParallel):
-        return model.module
-    return model
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. Hybrid Adaptive Vision Transformer
 # ═════════════════════════════════════════════════════════════════════════════
@@ -642,14 +636,6 @@ def train_adaptive(args):
     teacher.load_state_dict(student.state_dict())
     for p in teacher.parameters():
         p.requires_grad = False
-
-    if device.type == "cuda" and torch.cuda.device_count() > 1:
-        student = nn.DataParallel(student)
-        teacher = nn.DataParallel(teacher)
-        print(f"Using DataParallel on {torch.cuda.device_count()} GPUs.")
-    else:
-        print("Using a single GPU or CPU.")
-
     print(f"Hybrid model built: indep={args.num_indep_layers}, shared={num_shared}, "
           f"embed_dim={embed_dim}, device={device}")
 
@@ -668,12 +654,9 @@ def train_adaptive(args):
     ).to(device)
 
     # ── optimizer ──
-    student_core = unwrap_model(student)
-    teacher_core = unwrap_model(teacher)
-
-    backbone_params = list(student_core.backbone.parameters())
-    head_params = list(student_core.heads.parameters())
-    predictor_params = list(student_core.loss_predictor.parameters())
+    backbone_params = list(student.backbone.parameters())
+    head_params = list(student.heads.parameters())
+    predictor_params = list(student.loss_predictor.parameters())
     params_groups = [
         {"params": [p for p in backbone_params if p.requires_grad and p.ndim >= 2],
          "weight_decay": args.weight_decay},
@@ -708,7 +691,7 @@ def train_adaptive(args):
     utils.restart_from_checkpoint(
         os.path.join(args.output_dir, "checkpoint.pth"),
         run_variables=to_restore,
-        student=student_core, teacher=teacher_core, optimizer=optimizer,
+        student=student, teacher=teacher, optimizer=optimizer,
         fp16_scaler=fp16_scaler, adaptive_loss=adaptive_loss)
     start_epoch = to_restore["epoch"]
 
@@ -722,7 +705,7 @@ def train_adaptive(args):
             epoch, fp16_scaler, args, device, tb_writer)
 
         save_dict = {
-            'student': student_core.state_dict(), 'teacher': teacher_core.state_dict(),
+            'student': student.state_dict(), 'teacher': teacher.state_dict(),
             'optimizer': optimizer.state_dict(), 'epoch': epoch + 1,
             'args': args, 'adaptive_loss': adaptive_loss.state_dict(),
         }
@@ -752,8 +735,6 @@ def train_one_epoch(student, teacher, adaptive_loss, data_loader,
                     epoch, fp16_scaler, args, device, tb_writer=None):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    student_core = unwrap_model(student)
-    teacher_core = unwrap_model(teacher)
 
     for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
         global_it = len(data_loader) * epoch + it
@@ -775,7 +756,7 @@ def train_one_epoch(student, teacher, adaptive_loss, data_loader,
 
             loss, loss_dict = adaptive_loss(
                 logits_per_layer, teacher_logits,
-                student_core.loss_predictor, loss_intermediates, epoch)
+                student.loss_predictor, loss_intermediates, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()))
@@ -785,20 +766,20 @@ def train_one_epoch(student, teacher, adaptive_loss, data_loader,
         if fp16_scaler is None:
             loss.backward()
             if args.clip_grad:
-                utils.clip_gradients(student_core, args.clip_grad)
+                utils.clip_gradients(student, args.clip_grad)
             optimizer.step()
         else:
             fp16_scaler.scale(loss).backward()
             if args.clip_grad:
                 fp16_scaler.unscale_(optimizer)
-                utils.clip_gradients(student_core, args.clip_grad)
+                utils.clip_gradients(student, args.clip_grad)
             fp16_scaler.step(optimizer)
             fp16_scaler.update()
 
         # EMA update
         with torch.no_grad():
             m = momentum_schedule[global_it]
-            for param_q, param_k in zip(student_core.parameters(), teacher_core.parameters()):
+            for param_q, param_k in zip(student.parameters(), teacher.parameters()):
                 param_k.data.mul_(m).add_((1 - m) * param_q.detach().data)
 
         if device.type == "cuda":
@@ -836,9 +817,8 @@ def inference_with_early_exit(model, images, threshold=0.5):
     """threshold: sigmoid(logit) >= 값이면 exit."""
     model.eval()
     with torch.no_grad():
-        model_core = unwrap_model(model)
-        logits, exit_layer = model_core.backbone.forward_inference(
-            images, model_core.loss_predictor, model_core.heads, exit_prob=threshold)
+        logits, exit_layer = model.backbone.forward_inference(
+            images, model.loss_predictor, model.heads, exit_prob=threshold)
     return logits, exit_layer
 
 
