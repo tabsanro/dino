@@ -114,10 +114,9 @@ class HybridAdaptiveVisionTransformer(nn.Module):
             norm_layer(embed_dim) for _ in range(num_shared_recurrences)
         ])
 
-        # ── Depth Positional Embedding: [LOSS] 토큰 전용 ──
-        # shape: [num_shared_recurrences, embed_dim]
-        self.depth_embeds = nn.Parameter(
-            torch.zeros(num_shared_recurrences, embed_dim)
+        # ── Global Depth Positional Embedding ──
+        self.global_depth_embeds = nn.Parameter(
+            torch.zeros(self.num_shared_recurrences, 1, 1, embed_dim)
         )
 
         # ── 호환용 Identity Head ──
@@ -127,7 +126,7 @@ class HybridAdaptiveVisionTransformer(nn.Module):
         trunc_normal_(self.pos_embed, std=0.02)
         trunc_normal_(self.cls_token, std=0.02)
         trunc_normal_(self.loss_token, std=0.02)
-        trunc_normal_(self.depth_embeds, std=0.02)
+        trunc_normal_(self.global_depth_embeds, std=0.02)
         self.apply(self._init_weights)
 
     # --------------------------------------------------------------------- #
@@ -195,17 +194,12 @@ class HybridAdaptiveVisionTransformer(nn.Module):
         cls_intermediates  = []
         loss_intermediates = []
         for l in range(self.num_shared_recurrences):
-            # In-place 수정을 피하기 위해 새로운 텐서를 생성하여 Re-assemble
-            cls_t = x[:, 0:1, :]
-            loss_t = x[:, 1:2, :] + self.depth_embeds[l].view(1, 1, -1)
-            patch_t = x[:, 2:, :]
-            x = torch.cat([cls_t, loss_t, patch_t], dim=1)
+            x = x + self.global_depth_embeds[l]
+            x = self.shared_block(x)              # [B, 2+P, D]
+            normed = self.shared_norms[l](x)
 
-            x = self.shared_block(x)                        # [B, 2+P, D]
-
-            normed = self.shared_norms[l](x)                # [B, 2+P, D]
-            cls_out  = normed[:, 0]                         # [B, D]
-            loss_out = normed[:, 1]                         # [B, D]
+            cls_out  = normed[:, 0]
+            loss_out = normed[:, 1]
 
             cls_intermediates.append(cls_out)
             loss_intermediates.append(loss_out)
@@ -228,15 +222,12 @@ class HybridAdaptiveVisionTransformer(nn.Module):
 
         # Shared Phase with Early Exit
         for l in range(self.num_shared_recurrences):
-            cls_t = x[:, 0:1, :]
-            loss_t = x[:, 1:2, :] + self.depth_embeds[l].view(1, 1, -1)
-            patch_t = x[:, 2:, :]
-            x = torch.cat([cls_t, loss_t, patch_t], dim=1)
-
-            x = self.shared_block(x)
+            x = x + self.global_depth_embeds[l]
+            x = self.shared_block(x)              # [B, 2+P, D]
             normed = self.shared_norms[l](x)
-            cls_out  = normed[:, 0]                         # [B, D]
-            loss_out = normed[:, 1]                         # [B, D]
+
+            cls_out  = normed[:, 0]
+            loss_out = normed[:, 1]
 
             with torch.no_grad():
                 pred_logit = loss_predictor(loss_out, l)     # [B]
@@ -336,35 +327,34 @@ class AdaptiveDINOLoss(nn.Module):
         w = t if self.align_warmup_mode == "linear" else 0.5 * (1.0 - math.cos(math.pi * t))
         return init + (target - init) * w
 
-    def _update_ema_and_get_targets(self, per_layer_losses, epoch):
+    def _update_ema_and_get_targets(self, inst_losses, epoch):
         """
-        레이어별 EMA 업데이트 후 동적 threshold 계산.
-        첫 번째 호출 시 EMA를 현재 값으로 초기화 (cold start 방지).
+        inst_losses: [num_layers, B]
         """
-        loss_device = per_layer_losses[0].device
-        loss_vals = torch.tensor(
-            [per_layer_losses[l].detach().item() for l in range(self.num_layers)],
-            device=self.loss_ema.device
-        )
+        loss_device = inst_losses.device
+        loss_vals_mean = inst_losses.mean(dim=1).detach()
+        
+        self.loss_ema = self.loss_ema.to(loss_device)
         
         if not self._ema_initialized.item():
-            self.loss_ema.copy_(loss_vals)
-            self._ema_initialized.fill_(True)
+            self.loss_ema.copy_(loss_vals_mean)
+            self._ema_initialized.fill_(1)
         else:
             self.loss_ema = (self.ema_momentum * self.loss_ema 
-                            + (1 - self.ema_momentum) * loss_vals)
+                            + (1 - self.ema_momentum) * loss_vals_mean)
         
-        # align_warmup과 연동하여 동적 percentile 계산
-        alpha_align_curr = self.get_alpha_align(epoch)
-        effective_percentile = self.tau_percentile * (
-            alpha_align_curr / self.alpha_align_target
-        ) if self.alpha_align_target > 0 else 0.0
+        targets = []
+        thresholds = []
         
-        # 동적 threshold: 전체 레이어 EMA 중 하위 effective_percentile
-        threshold = torch.quantile(self.loss_ema, effective_percentile)
-        
-        targets = (loss_vals <= threshold).float()  # [num_layers]
-        return targets.to(loss_device), threshold.item()
+        for l in range(self.num_layers):
+            layer_median = self.loss_ema[l]  # 해당 레이어의 기대 손실
+            # 레이어별로 독립적으로 "이 샘플이 이 레이어에서 충분히 수렴했는가" 판단
+            target_l = (inst_losses[l].detach() <= layer_median).float()  # [B]
+            targets.append(target_l)
+            thresholds.append(layer_median.item())
+            
+        targets = torch.stack(targets)  # [num_layers, B]
+        return targets.to(loss_device), thresholds
 
     def forward(self, student_logits_per_layer, teacher_logits,
                 loss_predictor, loss_intermediates, epoch):
@@ -379,37 +369,74 @@ class AdaptiveDINOLoss(nn.Module):
         temp = self.teacher_temp_schedule[min(epoch, len(self.teacher_temp_schedule) - 1)]
         teacher_out = F.softmax((teacher_logits - self.center) / temp, dim=-1)
         teacher_out = teacher_out.detach().chunk(2)
+        B = teacher_out[0].shape[0]
 
         # ① L_distill
-        per_layer_losses = []
+        per_layer_losses_mean = []
+        per_layer_losses_inst = []
         for l in range(self.num_layers):
             s_out = student_logits_per_layer[l] / self.student_temp
             s_out = s_out.chunk(self.ncrops)
-            layer_loss, n_terms = 0.0, 0
+            layer_loss_mean = 0.0
+            layer_loss_inst = torch.zeros(B, device=teacher_logits.device)
+            n_terms = 0
+            # inst_loss 추적용 카운트
+            inst_terms = 0
             for iq, q in enumerate(teacher_out):
                 for v in range(len(s_out)):
                     if v == iq:
                         continue
-                    loss = torch.sum(-q * F.log_softmax(s_out[v], dim=-1), dim=-1)
-                    layer_loss += loss.mean()
+                    
+                    # chunk별 loss 계산
+                    loss_v = torch.sum(-q * F.log_softmax(s_out[v], dim=-1), dim=-1)
+                    
+                    if v < 2:
+                        # global crop일 때만 teacher 샘플 인덱스와 1:1 매칭됨
+                        layer_loss_inst += loss_v[:B]
+                        inst_terms += 1
+                        
+                    layer_loss_mean += loss_v.mean()
                     n_terms += 1
-            per_layer_losses.append(layer_loss / n_terms)
+            per_layer_losses_mean.append(layer_loss_mean / n_terms)
+            per_layer_losses_inst.append(layer_loss_inst / inst_terms)
 
-        L_distill = sum(per_layer_losses)
+        # 수정: 마지막 레이어가 주 학습 신호, 앞 레이어는 보조
+        layer_weights = torch.linspace(0.1, 1.0, self.num_layers)  # [0.1, 0.28, ... , 1.0]
+        layer_weights = layer_weights / layer_weights.sum()  # 합이 1이 되도록 정규화
+        L_distill = sum(w * loss for w, loss in zip(layer_weights, per_layer_losses_mean))
 
-        # ── 동적 target 생성 ──
-        layer_targets, dynamic_threshold = self._update_ema_and_get_targets(per_layer_losses, epoch)
+        inst_losses = torch.stack(per_layer_losses_inst) # [num_layers, B]
 
-        # ② L_align (BCE) — [LOSS] 토큰 사용
+        # ── 동적 target 생성 (로깅용 유지) ──
+        layer_targets, dynamic_thresholds = self._update_ema_and_get_targets(inst_losses, epoch)
+
+        # ③ L_align (BCE) 타겟 생성 및 계산
         B_global = teacher_logits.shape[0]
         align_terms, pred_logits_det, target_det = [], [], []
+
+        # 하이퍼파라미터: 최소 요구 개선율 (예: 0.02 = 2% 이상 개선되지 않으면 종료)
+        margin_gamma = 0.02 
+
         for l in range(self.num_layers):
-            z_l = loss_intermediates[l][:B_global]                         # [2B, D]
-            pred_logit_l = loss_predictor(z_l, l).view(-1)        # [2B]
-            target_l = torch.full_like(pred_logit_l, layer_targets[l].item())
+            z_l = loss_intermediates[l][:B_global]
+            pred_logit_l = loss_predictor(z_l, l).view(-1)
+            
+            if l == 0:
+                # 첫 번째 루프는 비교 대상이 없으며, 무조건 통과해야 함 (Exit 불허)
+                target_value = torch.zeros(B, device=z_l.device)
+            else:
+                # 한계 효용 측정: 현재 Loss가 이전 Loss의 (1 - gamma)보다 크거나 같으면 개선이 미미한 것으로 판단
+                prev_loss = inst_losses[l-1].detach()
+                curr_loss = inst_losses[l].detach()
+                target_value = (curr_loss >= prev_loss * (1.0 - margin_gamma)).float()
+            
+            # 두 개의 Global Crop에 대해 타겟 복제
+            target_l = target_value.repeat(2)
+            
             bce_l = F.binary_cross_entropy_with_logits(
                 pred_logit_l, target_l,
-                pos_weight=self.bce_pos_weight_tensor.to(pred_logit_l.device))
+                pos_weight=self.bce_pos_weight_tensor.to(pred_logit_l.device)
+            )
             align_terms.append(bce_l)
             pred_logits_det.append(pred_logit_l.detach())
             target_det.append(target_l.detach())
@@ -451,8 +478,11 @@ class AdaptiveDINOLoss(nn.Module):
             "alpha_align_curr": float(alpha_align_curr),
             "align_acc": align_acc.item(),
             "target_pos_rate": layer_targets.mean().item(),
-            "dynamic_threshold": dynamic_threshold,
+            "dynamic_threshold_avg": sum(dynamic_thresholds) / len(dynamic_thresholds),
         }
+        layer_pos_rates = layer_targets.mean(dim=1)  # [num_layers]
+        for l in range(self.num_layers):
+            loss_dict[f"pos_rate_l{l}"] = layer_pos_rates[l].item()
         return total_loss, loss_dict
 
     @torch.no_grad()
