@@ -296,6 +296,7 @@ class AdaptiveDINOLoss(nn.Module):
                  warmup_teacher_temp_epochs=0, nepochs=100,
                  student_temp=0.1, center_momentum=0.9,
                  alpha_align=0.1, alpha_pressure=0.1,
+                 target_sim_threshold=0.90,
                  align_warmup_init=0.0,
                  align_warmup_start_epoch=None,
                  align_warmup_end_epoch=None,
@@ -314,6 +315,7 @@ class AdaptiveDINOLoss(nn.Module):
 
         self.alpha_align_target = alpha_align
         self.alpha_pressure_target = alpha_pressure
+        self.target_sim_threshold = target_sim_threshold
         self.align_warmup_init = align_warmup_init
         self.align_warmup_start_epoch = nepochs // 2 if align_warmup_start_epoch is None else align_warmup_start_epoch
         self.align_warmup_end_epoch = nepochs - 1 if align_warmup_end_epoch is None else align_warmup_end_epoch
@@ -429,18 +431,23 @@ class AdaptiveDINOLoss(nn.Module):
         teacher_out = F.softmax((teacher_logits - self.center) / temp, dim=-1)
         teacher_out = teacher_out.detach().chunk(2)
         B = teacher_out[0].shape[0]
+        global_batch = teacher_logits.shape[0]
+        if global_batch != 2 * B:
+            raise ValueError(
+                f"Expected teacher_logits to contain 2 global crops, got {global_batch} samples "
+                f"for a per-crop batch size of {B}."
+            )
+
+        with torch.no_grad():
+            t_feat = F.normalize(teacher_logits, p=2, dim=-1)
 
         # ① L_distill
         per_layer_losses_mean = []
-        per_layer_losses_inst = []
         for l in range(self.num_layers):
             s_out = student_logits_per_layer[l] / self.student_temp
             s_out = s_out.chunk(self.ncrops)
             layer_loss_mean = 0.0
-            layer_loss_inst = torch.zeros(B, device=teacher_logits.device)
             n_terms = 0
-            # inst_loss 추적용 카운트
-            inst_terms = 0
             for iq, q in enumerate(teacher_out):
                 for v in range(len(s_out)):
                     if v == iq:
@@ -448,49 +455,39 @@ class AdaptiveDINOLoss(nn.Module):
                     
                     # chunk별 loss 계산
                     loss_v = torch.sum(-q * F.log_softmax(s_out[v], dim=-1), dim=-1)
-                    
-                    if v < 2:
-                        # global crop일 때만 teacher 샘플 인덱스와 1:1 매칭됨
-                        layer_loss_inst += loss_v[:B]
-                        inst_terms += 1
-                        
+
                     layer_loss_mean += loss_v.mean()
                     n_terms += 1
             per_layer_losses_mean.append(layer_loss_mean / n_terms)
-            per_layer_losses_inst.append(layer_loss_inst / inst_terms)
 
         layer_weights = self._get_distill_weights(teacher_logits.device)
         L_distill = torch.zeros((), device=teacher_logits.device, dtype=teacher_logits.dtype)
         for w, loss in zip(layer_weights, per_layer_losses_mean):
             L_distill = L_distill + w * loss
 
-        inst_losses = torch.stack(per_layer_losses_inst) # [num_layers, B]
-
-        # ── 동적 target 생성 (로깅용 유지) ──
-        layer_targets, dynamic_thresholds = self._update_ema_and_get_targets(inst_losses, epoch)
-
         # ③ L_align (BCE) 타겟 생성 및 계산
-        B_global = teacher_logits.shape[0]
         align_terms, pred_logits_det, target_det = [], [], []
-
-        # 하이퍼파라미터: 최소 요구 개선율 (예: 0.02 = 2% 이상 개선되지 않으면 종료)
-        margin_gamma = 0.02 
+        layer_targets = []
+        dynamic_thresholds = []
 
         for l in range(self.num_layers):
-            z_l = loss_intermediates[l][:B_global]
+            z_l = loss_intermediates[l][:global_batch]
             pred_logit_l = loss_predictor(z_l, l).view(-1)
             
-            if l == 0:
-                # 첫 번째 루프는 비교 대상이 없으며, 무조건 통과해야 함 (Exit 불허)
-                target_value = torch.zeros(B, device=z_l.device)
+            if l == self.num_layers - 1:
+                target_value = torch.ones(B, device=z_l.device)
             else:
-                # 한계 효용 측정: 현재 Loss가 이전 Loss의 (1 - gamma)보다 크거나 같으면 개선이 미미한 것으로 판단
-                prev_loss = inst_losses[l-1].detach()
-                curr_loss = inst_losses[l].detach()
-                target_value = (curr_loss >= prev_loss * (1.0 - margin_gamma)).float()
+                s_feat_l = student_logits_per_layer[l][:global_batch]
+                s_feat_l = F.normalize(s_feat_l, p=2, dim=-1)
+
+                sim = torch.sum(s_feat_l * t_feat, dim=-1)
+                sim_avg = (sim[:B] + sim[B:global_batch]) / 2.0
+                target_value = (sim_avg >= self.target_sim_threshold).float()
             
-            # 두 개의 Global Crop에 대해 타겟 복제
             target_l = target_value.repeat(2)
+
+            layer_targets.append(target_value)
+            dynamic_thresholds.append(float(self.target_sim_threshold))
             
             bce_l = F.binary_cross_entropy_with_logits(
                 pred_logit_l, target_l,
@@ -505,7 +502,7 @@ class AdaptiveDINOLoss(nn.Module):
         # ③ L_pressure — expected depth 최소화
         prob_layers = []
         for l in range(self.num_layers):
-            z_l = loss_intermediates[l][:B_global]
+            z_l = loss_intermediates[l][:global_batch]
             pred_logit_l = loss_predictor(z_l, l).view(-1)
             prob_layers.append(torch.sigmoid(pred_logit_l))
         p = torch.stack(prob_layers, dim=1)                                # [2B, L]
@@ -529,6 +526,8 @@ class AdaptiveDINOLoss(nn.Module):
             pred_all = torch.cat(pred_logits_det)
             tgt_all  = torch.cat(target_det)
             align_acc = ((pred_all >= 0).float() == tgt_all).float().mean()
+
+            layer_targets = torch.stack(layer_targets)
 
         loss_dict = {
             "L_distill": L_distill.item(), "L_align": L_align.item(),
@@ -624,6 +623,8 @@ def get_args_parser():
     # ── Loss ──
     parser.add_argument('--alpha_align', default=0.1, type=float)
     parser.add_argument('--alpha_pressure', default=0.1, type=float)
+    parser.add_argument('--target_sim_threshold', default=0.90, type=float,
+                        help='Cosine similarity threshold for the adaptive alignment target.')
     parser.add_argument('--align_warmup_init', default=0.0, type=float)
     parser.add_argument('--align_warmup_start_epoch', default=None, type=int)
     parser.add_argument('--align_warmup_end_epoch', default=None, type=int)
@@ -745,6 +746,7 @@ def train_adaptive(args):
         warmup_teacher_temp=args.warmup_teacher_temp, teacher_temp=args.teacher_temp,
         warmup_teacher_temp_epochs=args.warmup_teacher_temp_epochs, nepochs=args.epochs,
         alpha_align=args.alpha_align, alpha_pressure=args.alpha_pressure,
+        target_sim_threshold=args.target_sim_threshold,
         align_warmup_init=args.align_warmup_init,
         align_warmup_start_epoch=args.align_warmup_start_epoch,
         align_warmup_end_epoch=args.align_warmup_end_epoch,
